@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
 from env import AttrDict, build_env
-from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
+from meldataset import MelDataset
 from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
     discriminator_loss
 from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
@@ -71,12 +71,10 @@ def train(rank, a, h):
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
 
-    training_filelist, validation_filelist = get_dataset_filelist(a)
-
-    trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
+    trainset = MelDataset(a.root_path, a.train_scp_file, a.feature_stats_file, h.segment_size, h.n_fft, h.num_mels,
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
-                          fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir)
+                          fine_tuning=a.fine_tuning)
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -87,10 +85,23 @@ def train(rank, a, h):
                               drop_last=True)
 
     if rank == 0:
-        validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
-                              h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
-                              fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                              base_mels_path=a.input_mels_dir)
+        validset = MelDataset(a.root_path,
+                              a.valid_scp_file,
+                              a.feature_stats_file,
+                              h.segment_size,
+                              h.n_fft,
+                              h.num_mels,
+                              h.hop_size,
+                              h.win_size,
+                              h.sampling_rate,
+                              h.fmin,
+                              h.fmax,
+                              False,
+                              False,
+                              n_cache_reuse=0,
+                              fmax_loss=h.fmax_for_loss,
+                              device=device,
+                              fine_tuning=a.fine_tuning)
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
                                        batch_size=1,
@@ -119,9 +130,10 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
-            y_g_hat = generator(x)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                          h.fmin, h.fmax_for_loss)
+            y_g_hat = generator(x[:, :, :-1])  #"-1" to account for stft padding
+            y_g_hat_mel = trainset.mel_spectrogram_loss(y_g_hat.squeeze(1))
+            # print(x.shape, y_g_hat.shape, y_g_hat_mel.shape,
+            #       y_g_hat.shape[2] / x.shape[2], y_g_hat_mel.shape[2] / x.shape[2])
 
             optim_d.zero_grad()
 
@@ -170,7 +182,7 @@ def train(rank, a, h):
                     save_checkpoint(checkpoint_path,
                                     {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
                     checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path, 
+                    save_checkpoint(checkpoint_path,
                                     {'mpd': (mpd.module if h.num_gpus > 1
                                                          else mpd).state_dict(),
                                      'msd': (msd.module if h.num_gpus > 1
@@ -191,11 +203,9 @@ def train(rank, a, h):
                     with torch.no_grad():
                         for j, batch in enumerate(validation_loader):
                             x, y, _, y_mel = batch
-                            y_g_hat = generator(x.to(device))
+                            y_g_hat = generator(x[:,:,:-1].to(device)) #"-1" to account for stft padding
                             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
-                            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
-                                                          h.hop_size, h.win_size,
-                                                          h.fmin, h.fmax_for_loss)
+                            y_g_hat_mel = trainset.mel_spectrogram_loss(y_g_hat.squeeze(1))
                             val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
 
                             if j <= 4:
@@ -204,9 +214,7 @@ def train(rank, a, h):
                                     sw.add_figure('gt/y_spec_{}'.format(j), plot_spectrogram(x[0]), steps)
 
                                 sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
-                                y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels,
-                                                             h.sampling_rate, h.hop_size, h.win_size,
-                                                             h.fmin, h.fmax)
+                                y_hat_spec = trainset.mel_spectrogram(y_g_hat.squeeze(1))
                                 sw.add_figure('generated/y_hat_spec_{}'.format(j),
                                               plot_spectrogram(y_hat_spec.squeeze(0).cpu().numpy()), steps)
 
@@ -219,7 +227,7 @@ def train(rank, a, h):
 
         scheduler_g.step()
         scheduler_d.step()
-        
+
         if rank == 0:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
@@ -230,10 +238,13 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--group_name', default=None)
-    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
-    parser.add_argument('--input_mels_dir', default='ft_dataset')
-    parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
-    parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
+    parser.add_argument('--root_path', default='', type=str)
+    parser.add_argument('--feature_stats_file', default='', type=str)
+    parser.add_argument('--train_scp_file',
+                        default='/dump/raw/tr_no_dev/wav.scp', type=str)
+    parser.add_argument('--valid_scp_file',
+                        default='/dump/raw/dev/wav.scp',
+                        type=str)
     parser.add_argument('--checkpoint_path', default='cp_hifigan')
     parser.add_argument('--config', default='')
     parser.add_argument('--training_epochs', default=3100, type=int)
