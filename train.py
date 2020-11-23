@@ -224,6 +224,8 @@ def train(rank, a, h):
                     generator.train()
 
             steps += 1
+            # if i>1:
+            #     break
 
         scheduler_g.step()
         scheduler_d.step()
