@@ -4,6 +4,7 @@ import random
 import torch
 import torch.utils.data
 import numpy as np
+import librosa
 from librosa.util import normalize
 from scipy.io.wavfile import read
 from librosa.filters import mel as librosa_mel_fn
@@ -98,8 +99,8 @@ class MelDataset(torch.utils.data.Dataset):
         self.num_mels = num_mels
         self.hop_size = hop_size
         self.win_size = win_size
-        self.fmin = fmin
-        self.fmax = fmax
+        self.fmin = 0 if fmin is None else fmin
+        self.fmax = sampling_rate / 2 if fmax is None else fmax
         self.fmax_loss = fmax_loss
         self.cached_wav = None
         self.n_cache_reuse = n_cache_reuse
@@ -109,7 +110,7 @@ class MelDataset(torch.utils.data.Dataset):
 
         self.root_path = root_path
         self.scp_file_path = root_path+scp_file
-        self.loader = SoundScpReader(self.scp_file_path, root_path=self.root_path, normalize=True, always_2d=False)
+        self.loader = SoundScpReader(self.scp_file_path, root_path=self.root_path, normalize=True, always_2d=False, sampling_rate=self.sampling_rate)
         self.logmel_layer = LogMelFbank(fs=sampling_rate,
                                    n_fft=n_fft,
                                    win_length=win_size,
@@ -135,6 +136,7 @@ class MelDataset(torch.utils.data.Dataset):
         self.norm_layer = GlobalMVN(stats_file=feature_stats_file_path,
                                     norm_means=True,
                                     norm_vars=True)
+
         self.keys = list(self.loader.keys())
 
     # def keys(self):
@@ -146,25 +148,66 @@ class MelDataset(torch.utils.data.Dataset):
     # def __iter__(self):
     #     return iter(self.loader)
 
+    def logmelfilterbank(self, audio,
+                     fft_size=1024,
+                     hop_size=256,
+                     win_length=None,
+                     window="hann",
+                     eps=1e-10, mel_basis=None
+                     ):
+        """Compute log-Mel filterbank feature.
+
+        Args:
+            audio (ndarray): Audio signal (T,).
+            fft_size (int): FFT size.
+            hop_size (int): Hop size.
+            win_length (int): Window length. If set to None, it will be the same as fft_size.
+            window (str): Window function type.
+            eps (float): Epsilon value to avoid inf in log calculation.
+
+        Returns:
+            ndarray: Log Mel filterbank feature (#frames, num_mels).
+
+        """
+        # get amplitude spectrogram
+        x_stft = librosa.stft(audio, n_fft=fft_size, hop_length=hop_size,
+                            win_length=win_length, window=window, pad_mode="reflect")
+        spc = np.abs(x_stft).T  # (#frames, #bins)
+
+        return np.log10(np.maximum(eps, np.dot(spc, mel_basis)))
+
+
+    def mel_spectrograms(self, audio):
+        # extract feature
+        mel, _ = self.logmel_layer(torch.FloatTensor(audio).unsqueeze(0))
+        mel_loss, _ = self.logmel_layer_loss(torch.FloatTensor(audio).unsqueeze(0))
+
+        # make sure the audio length and feature length are matched
+        n_mel = mel.shape[1] #number of mel frames
+        audio = np.pad(audio, (0, self.n_fft), mode="reflect")
+        audio = audio[:n_mel * self.hop_size]
+        assert n_mel * self.hop_size == len(audio)
+
+        normed_mel, _       = self.norm_layer(torch.FloatTensor(mel))
+        normed_mel_loss, _  = self.norm_layer(torch.FloatTensor(mel_loss))
+
+        return torch.FloatTensor(audio), torch.transpose(normed_mel, 1, 2), torch.transpose(normed_mel_loss, 1, 2)
+
+
     def mel_spectrogram_loss(self, audio):
-        # audio = torch.nn.functional.pad(audio.unsqueeze(1), (int(
-        #     (self.n_fft - self.hop_size) / 2), int((self.n_fft - self.hop_size) / 2)),
-        #                             mode='reflect')
-        # audio = audio.squeeze(1)
-        logmel_audio, _ = self.logmel_layer_loss(audio)
-        normed_audio, _ = self.norm_layer(logmel_audio)
-        return torch.transpose(normed_audio, 1, 2)
+        # extract feature
+        # print(audio.shape)
 
+        mel_loss, _ = self.logmel_layer_loss(audio)
 
-    def mel_spectrogram(self, audio):
-        # audio = torch.nn.functional.pad(audio.unsqueeze(1), (int(
-        #     (self.n_fft - self.hop_size) /
-        #     2), int((self.n_fft - self.hop_size) / 2)),
-        #                                 mode='reflect')
-        # audio = audio.squeeze(1)
-        logmel_audio, _ = self.logmel_layer(audio)
-        normed_audio, _ = self.norm_layer(logmel_audio)
-        return torch.transpose(normed_audio, 1, 2)
+        # make sure the audio length and feature length are matched
+        # audio = torch.functional.pad(audio, (0, self.n_fft), mode="reflect")
+        # audio = audio[:len(mel_loss) * self.hop_size]
+        # assert len(mel_loss) * self.hop_size == len(audio)
+
+        normed_mel_loss, _ = self.norm_layer(mel_loss)
+
+        return torch.transpose(normed_mel_loss, 1, 2)
 
     def __getitem__(self, key:str):
 
@@ -179,30 +222,30 @@ class MelDataset(torch.utils.data.Dataset):
             audio = self.cached_wav
             self._cache_ref_count -= 1
 
-        #audio = torch.from_numpy(audio).to(torch.float32)
-        audio = torch.FloatTensor(audio)
         # make sure audio is a multiple of segment size to avoid mel size mismatch
-        pad_size = audio.size(0) % self.win_size
+        pad_size = audio.shape[0] % self.win_size
         if pad_size>0:
-            audio = torch.nn.functional.pad(audio, (0, pad_size), 'constant')
-        audio = audio.unsqueeze(0)
+            audio = np.pad(audio, (0, pad_size), 'constant')
+
+        #audio = audio.unsqueeze(0)
         if not self.fine_tuning:
             if self.split:
-                if audio.size(1) >= self.segment_size:
-                    max_audio_start = audio.size(1) - self.segment_size
+                if audio.shape[0] >= self.segment_size:
+                    max_audio_start = audio.shape[0] - self.segment_size
                     audio_start = random.randint(0, max_audio_start)
-                    audio = audio[:, audio_start:audio_start+self.segment_size]
+                    audio = audio[audio_start:audio_start+self.segment_size]
                 else:
-                    audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
+                    audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(0)), 'constant')
 
-            mel = self.mel_spectrogram(audio)
-            #print("\t\t", audio.shape, mel.shape)
+            audio, mel, mel_loss = self.mel_spectrograms(audio)
+
+            #print("getitem:245\t", audio.shape, mel.shape)
 
         else:
-            assert(0)
+            assert False
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
-            mel = torch.from_numpy(mel)
+            mel = torch.FloatTensor(mel)
 
             if len(mel.shape) < 3:
                 mel = mel.unsqueeze(0)
@@ -217,7 +260,7 @@ class MelDataset(torch.utils.data.Dataset):
                 else:
                     mel = torch.nn.functional.pad(mel, (0, frames_per_seg - mel.size(2)), 'constant')
                     audio = torch.nn.functional.pad(audio, (0, self.segment_size - audio.size(1)), 'constant')
+            mel_loss = mel
 
-        mel_loss = self.mel_spectrogram(audio)
-        return (mel.squeeze(), audio.squeeze(0),
+        return (mel.squeeze(), audio,
                 self.loader.get_path(self.keys[key]), mel_loss.squeeze())
